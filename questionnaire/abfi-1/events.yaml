@@ -1,0 +1,16 @@
+messages:
+- id: start
+  text: Дорогой участник, добро п
+  file:
+  - 1.webp
+  - foo.mp4
+  buttons:
+  - id: 1
+    text: Начать курс
+    action: start_course
+    event: message_1
+  - id: 2
+    text: Начать курс
+    action: start_course
+    event: message_1
+  delay_minutes: 0
