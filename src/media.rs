@@ -17,7 +17,7 @@ pub async fn send_one(bot: &Bot, chat: ChatId, path: &Path) {
         .to_ascii_lowercase();
 
     let result = match ext.as_str() {
-        "jpg" | "jpeg" | "png" => bot
+        "jpg" | "jpeg" | "png" | "webp" => bot
             .send_photo(chat, InputFile::file(path))
             .await
             .map(|_| ()),
