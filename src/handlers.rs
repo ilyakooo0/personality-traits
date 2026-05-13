@@ -153,7 +153,6 @@ async fn send_intro(bot: &Bot, chat: ChatId, course: &Course, restart_mode: bool
         .iter()
         .filter_map(|f| course.resolve_file(f))
         .collect();
-    media::send_files(bot, chat, &files).await;
 
     let (button_text, callback_data) = if restart_mode {
         ("Начать курс заново".to_string(), "crs:restart".to_string())
@@ -176,7 +175,7 @@ async fn send_intro(bot: &Bot, chat: ChatId, course: &Course, restart_mode: bool
     } else {
         intro.text.as_str()
     };
-    bot.send_message(chat, text).reply_markup(kb).await?;
+    media::send_event_message(bot, chat, &files, text, Some(kb)).await;
     Ok(())
 }
 
@@ -368,7 +367,6 @@ pub async fn send_event_with_keyboard(
         .iter()
         .filter_map(|f| course.resolve_file(f))
         .collect();
-    media::send_files(bot, chat, &files).await;
 
     let rows: Vec<Vec<InlineKeyboardButton>> = event
         .buttons
@@ -382,18 +380,11 @@ pub async fn send_event_with_keyboard(
         })
         .collect();
 
-    let text = if event.text.trim().is_empty() {
-        "(пустое сообщение)"
+    let keyboard = if rows.is_empty() {
+        None
     } else {
-        event.text.as_str()
+        Some(InlineKeyboardMarkup::new(rows))
     };
-
-    if rows.is_empty() {
-        bot.send_message(chat, text).await?;
-    } else {
-        bot.send_message(chat, text)
-            .reply_markup(InlineKeyboardMarkup::new(rows))
-            .await?;
-    }
+    media::send_event_message(bot, chat, &files, &event.text, keyboard).await;
     Ok(())
 }
