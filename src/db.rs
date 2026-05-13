@@ -1,0 +1,239 @@
+use std::str::FromStr;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+
+pub type Pool = SqlitePool;
+
+pub async fn connect(url: &str) -> Result<Pool> {
+    let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("run migrations")?;
+    Ok(pool)
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct User {
+    pub telegram_id: i64,
+    pub email: String,
+}
+
+pub async fn get_user(pool: &Pool, tg_id: i64) -> Result<Option<User>> {
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT telegram_id, email FROM users WHERE telegram_id = ?")
+            .bind(tg_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(telegram_id, email)| User { telegram_id, email }))
+}
+
+pub async fn upsert_user(
+    pool: &Pool,
+    tg_id: i64,
+    email: &str,
+    username: Option<&str>,
+    first_name: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO users (telegram_id, email, username, first_name, registered_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(telegram_id) DO UPDATE SET \
+            email = excluded.email, \
+            username = excluded.username, \
+            first_name = excluded.first_name",
+    )
+    .bind(tg_id)
+    .bind(email)
+    .bind(username)
+    .bind(first_name)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Session {
+    pub id: i64,
+    pub telegram_id: i64,
+    pub current_index: i64,
+}
+
+pub async fn active_session(pool: &Pool, tg_id: i64) -> Result<Option<Session>> {
+    let row: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, telegram_id, current_index FROM course_sessions \
+         WHERE telegram_id = ? AND finished_at IS NULL \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(tg_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, telegram_id, current_index)| Session {
+        id,
+        telegram_id,
+        current_index,
+    }))
+}
+
+pub async fn start_session(pool: &Pool, tg_id: i64) -> Result<Session> {
+    let now = Utc::now().to_rfc3339();
+    let id = sqlx::query(
+        "INSERT INTO course_sessions (telegram_id, started_at, current_index, last_action_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(tg_id)
+    .bind(&now)
+    .bind(0_i64)
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .last_insert_rowid();
+    Ok(Session {
+        id,
+        telegram_id: tg_id,
+        current_index: 0,
+    })
+}
+
+pub async fn finish_all_active(pool: &Pool, tg_id: i64) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE scheduled_messages SET sent_at = ? \
+         WHERE sent_at IS NULL AND session_id IN \
+             (SELECT id FROM course_sessions WHERE telegram_id = ? AND finished_at IS NULL)",
+    )
+    .bind(&now)
+    .bind(tg_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE course_sessions SET finished_at = ? \
+         WHERE telegram_id = ? AND finished_at IS NULL",
+    )
+    .bind(&now)
+    .bind(tg_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn finish_session(pool: &Pool, session_id: i64) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE scheduled_messages SET sent_at = ? WHERE session_id = ? AND sent_at IS NULL")
+        .bind(&now)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE course_sessions SET finished_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_session_index(pool: &Pool, session_id: i64, index: i64) -> Result<()> {
+    sqlx::query("UPDATE course_sessions SET current_index = ?, last_action_at = ? WHERE id = ?")
+        .bind(index)
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn record_button(
+    pool: &Pool,
+    tg_id: i64,
+    session_id: Option<i64>,
+    message_id: &str,
+    button_id: &str,
+    action: &str,
+    event_target: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO button_events \
+            (telegram_id, session_id, message_id, button_id, action, event_target, pressed_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(tg_id)
+    .bind(session_id)
+    .bind(message_id)
+    .bind(button_id)
+    .bind(action)
+    .bind(event_target)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn schedule(
+    pool: &Pool,
+    session_id: i64,
+    tg_id: i64,
+    message_id: &str,
+    send_after: DateTime<Utc>,
+) -> Result<i64> {
+    let id = sqlx::query(
+        "INSERT INTO scheduled_messages (session_id, telegram_id, message_id, send_after) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(tg_id)
+    .bind(message_id)
+    .bind(send_after.to_rfc3339())
+    .execute(pool)
+    .await?
+    .last_insert_rowid();
+    Ok(id)
+}
+
+#[derive(Debug)]
+pub struct ScheduledMessage {
+    pub id: i64,
+    pub session_id: i64,
+    pub telegram_id: i64,
+    pub message_id: String,
+}
+
+pub async fn due_messages(pool: &Pool, now: DateTime<Utc>) -> Result<Vec<ScheduledMessage>> {
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT id, session_id, telegram_id, message_id FROM scheduled_messages \
+         WHERE sent_at IS NULL AND send_after <= ? \
+         ORDER BY send_after ASC LIMIT 50",
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, session_id, telegram_id, message_id)| ScheduledMessage {
+                id,
+                session_id,
+                telegram_id,
+                message_id,
+            },
+        )
+        .collect())
+}
+
+pub async fn mark_sent(pool: &Pool, id: i64) -> Result<()> {
+    sqlx::query("UPDATE scheduled_messages SET sent_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
